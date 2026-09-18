@@ -9,7 +9,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -276,39 +275,14 @@ var _ = Describe("run basic podman commands", func() {
 		}
 
 		name := randomString()
-		i := new(initMachine).withImage(mb.imagePath).withRootful(true).withNow()
+		i := new(initMachine).withImage(mb.imagePath).withNow()
 		session, err := mb.setName(name).setCmd(i).run()
 		Expect(err).ToNot(HaveOccurred())
 		Expect(session).To(Exit(0))
-		defer func() {
+		DeferCleanup(func() {
 			stop := new(stopMachine)
 			_, _ = mb.setCmd(stop).run()
-		}()
-
-		// If a locally built Linux podman binary is present, update the test VM to use it
-		if isWSL() {
-			cwd, _ := os.Getwd()
-			linuxBinCandidates := []string{
-				filepath.Join(cwd, "bin/podman-linux"),
-				filepath.Join(cwd, "../../../bin/podman-linux"),
-			}
-			for _, binPath := range linuxBinCandidates {
-				if fi, err := os.Stat(binPath); err == nil && !fi.IsDir() {
-					wslPath := strings.ReplaceAll(binPath, `\`, `/`)
-					if len(wslPath) >= 2 && wslPath[1] == ':' {
-						wslPath = fmt.Sprintf("/mnt/%s%s", strings.ToLower(string(wslPath[0])), wslPath[2:])
-					}
-					distroName := "podman-" + name
-					cmdStr := fmt.Sprintf("cp %s /usr/sbin/podman.new && chmod 755 /usr/sbin/podman.new && mv -f /usr/sbin/podman.new /usr/sbin/podman && systemctl restart podman.socket podman.service 2>/dev/null || true", wslPath)
-					out, err := exec.Command("wsl.exe", "-d", distroName, "-u", "root", "sh", "-c", cmdStr).CombinedOutput()
-					if err != nil {
-						_ = exec.Command("wsl.exe", "-d", name, "-u", "root", "sh", "-c", cmdStr).Run()
-					}
-					_ = out
-					break
-				}
-			}
-		}
+		})
 
 		bm := basicMachine{}
 		freePort, err := getFreePort()
@@ -329,9 +303,9 @@ var _ = Describe("run basic podman commands", func() {
 		Expect(err).ToNot(HaveOccurred())
 		Expect(probeExec).To(Exit(0))
 
-		defer func() {
+		DeferCleanup(func() {
 			_, _ = mb.setCmd(bm.withPodmanCommand([]string{"rm", "-f", probeName})).run()
-		}()
+		})
 
 		// Explicit traffic verification: ensure host.containers.internal was resolved to a valid IP,
 		// matches an actual IP assigned to the Windows host (not the upstream router gateway),
@@ -375,11 +349,22 @@ var _ = Describe("run basic podman commands", func() {
 
 		probeServer, probeErr := tryStartLocalHTTPServer(freePort, "probe-ok")
 		if probeServer != nil {
-			defer probeServer.Close()
+			DeferCleanup(func() { _ = probeServer.Close() })
 		}
 
 		// The bind MUST work. If it fails in the affected environment, the test fails.
 		Expect(probeErr).ToNot(HaveOccurred(), "Issue #29778: host port bind failed after container traffic to host.containers.internal")
+
+		// Verify that the container can successfully reach the Windows HTTP server via host.containers.internal
+		Eventually(func(g Gomega) {
+			curlExec, err := mb.setCmd(bm.withPodmanCommand([]string{
+				"run", "--rm", "--network", "podman", TESTIMAGE,
+				"wget", "-q", "-O-", "-T", "3", probeURL,
+			})).run()
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(curlExec).To(Exit(0))
+			g.Expect(strings.TrimSpace(curlExec.outputToString())).To(Equal("probe-ok"))
+		}, "10s", "1s").Should(Succeed(), "container should successfully reach Windows HTTP server via host.containers.internal")
 	})
 
 	It("podman volume on non-standard path", func() {

@@ -11,87 +11,225 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
-func TestIsWSLMirrored(t *testing.T) {
-	origCmd := wslNetworkingModeCmd
-	defer func() { wslNetworkingModeCmd = origCmd }()
+func TestIsWSLMirroredMode(t *testing.T) {
+	t.Parallel()
 
 	tests := []struct {
 		name     string
-		mockOut  string
-		mockErr  error
+		mode     string
+		err      error
 		expected bool
 	}{
 		{
-			name:     "mirrored mode trimmed",
-			mockOut:  "mirrored",
-			mockErr:  nil,
+			name:     "mirrored mode lowercase",
+			mode:     "mirrored",
+			err:      nil,
 			expected: true,
 		},
 		{
-			name:     "mirrored mode with whitespace and newlines",
-			mockOut:  "  mirrored \r\n",
-			mockErr:  nil,
+			name:     "mirrored mode uppercase",
+			mode:     "MIRRORED",
+			err:      nil,
+			expected: true,
+		},
+		{
+			name:     "mirrored mode with surrounding whitespace and newlines",
+			mode:     "  mirrored \r\n",
+			err:      nil,
 			expected: true,
 		},
 		{
 			name:     "nat mode",
-			mockOut:  "nat",
-			mockErr:  nil,
+			mode:     "nat",
+			err:      nil,
 			expected: false,
 		},
 		{
 			name:     "virtioproxy mode",
-			mockOut:  "virtioproxy",
-			mockErr:  nil,
+			mode:     "virtioproxy",
+			err:      nil,
 			expected: false,
 		},
 		{
-			name:     "command error (e.g. wslinfo not found)",
-			mockOut:  "",
-			mockErr:  errors.New("executable not found"),
+			name:     "invalid mode string",
+			mode:     "unknown-mode",
+			err:      nil,
 			expected: false,
 		},
 		{
 			name:     "empty output",
-			mockOut:  "",
-			mockErr:  nil,
+			mode:     "",
+			err:      nil,
+			expected: false,
+		},
+		{
+			name:     "command error (wslinfo unavailable)",
+			mode:     "",
+			err:      errors.New("executable not found"),
 			expected: false,
 		},
 	}
 
 	for _, tt := range tests {
+		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			wslNetworkingModeCmd = func() (string, error) {
-				return tt.mockOut, tt.mockErr
-			}
-			assert.Equal(t, tt.expected, isWSLMirrored())
+			t.Parallel()
+			assert.Equal(t, tt.expected, isWSLMirroredMode(tt.mode, tt.err))
 		})
 	}
 }
 
-func TestGetMirroredHostIP(t *testing.T) {
-	// With nil gateway and negative link index, it should return empty string gracefully
-	ip := getMirroredHostIP(nil, -1)
-	assert.Empty(t, ip)
+func mockIPNet(cidr string) *net.IPNet {
+	ip, ipNet, _ := net.ParseCIDR(cidr)
+	ipNet.IP = ip
+	return ipNet
+}
 
-	// If there is a default route present, testing with its gateway and link should return a valid IPv4
-	routes, err := netlink.RouteList(nil, netlink.FAMILY_V4)
-	if err == nil {
-		for _, r := range routes {
-			if (r.Dst == nil || r.Dst.String() == defaultWSLRoute) && r.Gw != nil {
-				resolved := getMirroredHostIP(r.Gw, r.LinkIndex)
-				assert.NotEmpty(t, resolved)
-				parsed := net.ParseIP(resolved)
-				assert.NotNil(t, parsed)
-				assert.NotNil(t, parsed.To4())
-				break
-			}
+func TestResolveMirroredHostIP(t *testing.T) {
+	t.Parallel()
+
+	gwIP := net.ParseIP("192.168.1.1")
+	validHostIP := net.ParseIP("192.168.1.50")
+	loopbackIP := net.ParseIP("127.0.0.1")
+	unspecifiedIP := net.ParseIP("0.0.0.0")
+
+	t.Run("valid route source address", func(t *testing.T) {
+		t.Parallel()
+		routeSrcGetter := func(gw net.IP) ([]netlink.Route, error) {
+			return []netlink.Route{{Src: validHostIP}}, nil
 		}
+		ip := resolveMirroredHostIP(gwIP, 1, routeSrcGetter, nil)
+		assert.Equal(t, "192.168.1.50", ip)
+	})
+
+	t.Run("route source missing falls back to interface address", func(t *testing.T) {
+		t.Parallel()
+		routeSrcGetter := func(gw net.IP) ([]netlink.Route, error) {
+			return []netlink.Route{{Src: nil}}, nil
+		}
+		ifaceAddrsGetter := func(index int) ([]net.Addr, error) {
+			return []net.Addr{mockIPNet("192.168.1.50/24")}, nil
+		}
+		ip := resolveMirroredHostIP(gwIP, 1, routeSrcGetter, ifaceAddrsGetter)
+		assert.Equal(t, "192.168.1.50", ip)
+	})
+
+	t.Run("route source returns loopback falls back to interface address", func(t *testing.T) {
+		t.Parallel()
+		routeSrcGetter := func(gw net.IP) ([]netlink.Route, error) {
+			return []netlink.Route{{Src: loopbackIP}}, nil
+		}
+		ifaceAddrsGetter := func(index int) ([]net.Addr, error) {
+			return []net.Addr{mockIPNet("192.168.1.50/24")}, nil
+		}
+		ip := resolveMirroredHostIP(gwIP, 1, routeSrcGetter, ifaceAddrsGetter)
+		assert.Equal(t, "192.168.1.50", ip)
+	})
+
+	t.Run("route source returns unspecified falls back to interface address", func(t *testing.T) {
+		t.Parallel()
+		routeSrcGetter := func(gw net.IP) ([]netlink.Route, error) {
+			return []netlink.Route{{Src: unspecifiedIP}}, nil
+		}
+		ifaceAddrsGetter := func(index int) ([]net.Addr, error) {
+			return []net.Addr{mockIPNet("192.168.1.50/24")}, nil
+		}
+		ip := resolveMirroredHostIP(gwIP, 1, routeSrcGetter, ifaceAddrsGetter)
+		assert.Equal(t, "192.168.1.50", ip)
+	})
+
+	t.Run("route getter error falls back to interface address", func(t *testing.T) {
+		t.Parallel()
+		routeSrcGetter := func(gw net.IP) ([]netlink.Route, error) {
+			return nil, errors.New("netlink error")
+		}
+		ifaceAddrsGetter := func(index int) ([]net.Addr, error) {
+			return []net.Addr{mockIPNet("192.168.1.50/24")}, nil
+		}
+		ip := resolveMirroredHostIP(gwIP, 1, routeSrcGetter, ifaceAddrsGetter)
+		assert.Equal(t, "192.168.1.50", ip)
+	})
+
+	t.Run("interface only has loopback address returns empty", func(t *testing.T) {
+		t.Parallel()
+		routeSrcGetter := func(gw net.IP) ([]netlink.Route, error) {
+			return nil, errors.New("no route")
+		}
+		ifaceAddrsGetter := func(index int) ([]net.Addr, error) {
+			return []net.Addr{mockIPNet("127.0.0.1/8")}, nil
+		}
+		ip := resolveMirroredHostIP(gwIP, 1, routeSrcGetter, ifaceAddrsGetter)
+		assert.Empty(t, ip)
+	})
+
+	t.Run("nil gateway and invalid link index returns empty", func(t *testing.T) {
+		t.Parallel()
+		ip := resolveMirroredHostIP(nil, -1, nil, nil)
+		assert.Empty(t, ip)
+	})
+}
+
+func TestResolveWSLHostIP(t *testing.T) {
+	t.Parallel()
+
+	_, defaultDst, _ := net.ParseCIDR(defaultWSLRoute)
+	natGateway := net.ParseIP("172.28.0.1")
+	mirroredRouter := net.ParseIP("192.168.1.1")
+	windowsHostIP := net.ParseIP("192.168.1.100")
+
+	natRoutes := []netlink.Route{
+		{
+			Dst:       defaultDst,
+			Gw:        natGateway,
+			LinkIndex: 2,
+		},
 	}
+
+	mirroredRoutes := []netlink.Route{
+		{
+			Dst:       defaultDst,
+			Gw:        mirroredRouter,
+			LinkIndex: 2,
+		},
+	}
+
+	t.Run("preserves NAT mode gateway behavior", func(t *testing.T) {
+		t.Parallel()
+		ip := resolveWSLHostIP(natRoutes, false, nil, nil)
+		assert.Equal(t, "172.28.0.1", ip)
+	})
+
+	t.Run("mirrored mode resolves Windows host IP", func(t *testing.T) {
+		t.Parallel()
+		routeSrcGetter := func(gw net.IP) ([]netlink.Route, error) {
+			return []netlink.Route{{Src: windowsHostIP}}, nil
+		}
+		ip := resolveWSLHostIP(mirroredRoutes, true, routeSrcGetter, nil)
+		assert.Equal(t, "192.168.1.100", ip)
+		assert.NotEqual(t, mirroredRouter.String(), ip)
+	})
+
+	t.Run("mirrored mode with unresolvable host returns empty string rather than router gateway", func(t *testing.T) {
+		t.Parallel()
+		routeSrcGetter := func(gw net.IP) ([]netlink.Route, error) {
+			return nil, errors.New("unresolvable")
+		}
+		ifaceAddrsGetter := func(index int) ([]net.Addr, error) {
+			return nil, errors.New("no addresses")
+		}
+		ip := resolveWSLHostIP(mirroredRoutes, true, routeSrcGetter, ifaceAddrsGetter)
+		assert.Empty(t, ip, "in mirrored mode, failure to resolve host IP must return empty string, never the router gateway")
+	})
+
+	t.Run("empty routing table returns empty string", func(t *testing.T) {
+		t.Parallel()
+		ip := resolveWSLHostIP(nil, false, nil, nil)
+		assert.Empty(t, ip)
+	})
 }
 
 func TestWSLHostIP(t *testing.T) {
-	// In an environment with default route, wslHostIP should return a valid IP or empty string without crashing
+	// In an environment with a default route, wslHostIP should return a valid IP or empty string without crashing
 	ip := wslHostIP()
 	if ip != "" {
 		parsed := net.ParseIP(ip)
