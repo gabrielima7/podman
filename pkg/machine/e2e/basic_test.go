@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"runtime"
@@ -275,7 +276,7 @@ var _ = Describe("run basic podman commands", func() {
 		}
 
 		name := randomString()
-		i := new(initMachine).withImage(mb.imagePath).withNow()
+		i := new(initMachine).withImage(mb.imagePath).withRootful(true).withNow()
 		session, err := mb.setName(name).setCmd(i).run()
 		Expect(err).ToNot(HaveOccurred())
 		Expect(session).To(Exit(0))
@@ -283,6 +284,31 @@ var _ = Describe("run basic podman commands", func() {
 			stop := new(stopMachine)
 			_, _ = mb.setCmd(stop).run()
 		}()
+
+		// If a locally built Linux podman binary is present, update the test VM to use it
+		if isWSL() {
+			cwd, _ := os.Getwd()
+			linuxBinCandidates := []string{
+				filepath.Join(cwd, "bin/podman-linux"),
+				filepath.Join(cwd, "../../../bin/podman-linux"),
+			}
+			for _, binPath := range linuxBinCandidates {
+				if fi, err := os.Stat(binPath); err == nil && !fi.IsDir() {
+					wslPath := strings.ReplaceAll(binPath, `\`, `/`)
+					if len(wslPath) >= 2 && wslPath[1] == ':' {
+						wslPath = fmt.Sprintf("/mnt/%s%s", strings.ToLower(string(wslPath[0])), wslPath[2:])
+					}
+					distroName := "podman-" + name
+					cmdStr := fmt.Sprintf("cp %s /usr/sbin/podman.new && chmod 755 /usr/sbin/podman.new && mv -f /usr/sbin/podman.new /usr/sbin/podman && systemctl restart podman.socket podman.service 2>/dev/null || true", wslPath)
+					out, err := exec.Command("wsl.exe", "-d", distroName, "-u", "root", "sh", "-c", cmdStr).CombinedOutput()
+					if err != nil {
+						_ = exec.Command("wsl.exe", "-d", name, "-u", "root", "sh", "-c", cmdStr).Run()
+					}
+					_ = out
+					break
+				}
+			}
+		}
 
 		bm := basicMachine{}
 		freePort, err := getFreePort()
@@ -308,6 +334,7 @@ var _ = Describe("run basic podman commands", func() {
 		}()
 
 		// Explicit traffic verification: ensure host.containers.internal was resolved to a valid IP,
+		// matches an actual IP assigned to the Windows host (not the upstream router gateway),
 		// and an outbound TCP connect attempt was made by the container before the host bind is attempted.
 		// Note: This checks for an initiated connect attempt at the socket syscall level rather than raw
 		// packet-level SYN, since user-space wget output instruments socket connection results.
@@ -320,6 +347,19 @@ var _ = Describe("run basic podman commands", func() {
 			g.Expect(fields).ToNot(BeEmpty(), "resolved.txt should contain host entry")
 			parsedIP := net.ParseIP(fields[0])
 			g.Expect(parsedIP).ToNot(BeNil(), fmt.Sprintf("resolved host IP %q should be a valid IP address", fields[0]))
+
+			// Verify that the resolved address is indeed an address assigned to the Windows host
+			// (not the default gateway router on the LAN).
+			hostAddrs, err := net.InterfaceAddrs()
+			g.Expect(err).ToNot(HaveOccurred())
+			isWindowsHostIP := false
+			for _, addr := range hostAddrs {
+				if ipNet, ok := addr.(*net.IPNet); ok && ipNet.IP.Equal(parsedIP) {
+					isWindowsHostIP = true
+					break
+				}
+			}
+			g.Expect(isWindowsHostIP).To(BeTrue(), fmt.Sprintf("resolved host.containers.internal IP %s must match an address assigned to the Windows host, not the upstream router gateway", parsedIP.String()))
 
 			tcpLog, err := mb.setCmd(bm.withPodmanCommand([]string{"exec", probeName, "cat", "/tmp/probe.log"})).run()
 			g.Expect(err).ToNot(HaveOccurred())
@@ -506,11 +546,24 @@ func isWSLMirroredHostAddressLoopback() bool {
 	if runtime.GOOS != "windows" || !isWSL() {
 		return false
 	}
-	userProfile := os.Getenv("USERPROFILE")
-	if userProfile == "" {
-		return false
+	candidates := []string{}
+	if up := os.Getenv("USERPROFILE"); up != "" {
+		candidates = append(candidates, filepath.Join(up, ".wslconfig"))
 	}
-	content, err := os.ReadFile(filepath.Join(userProfile, ".wslconfig"))
+	if hd, hp := os.Getenv("HOMEDRIVE"), os.Getenv("HOMEPATH"); hd != "" && hp != "" {
+		candidates = append(candidates, filepath.Join(hd+hp, ".wslconfig"))
+	}
+	if un := os.Getenv("USERNAME"); un != "" {
+		candidates = append(candidates, filepath.Join(`C:\Users`, un, ".wslconfig"))
+	}
+	var content []byte
+	var err error
+	for _, p := range candidates {
+		content, err = os.ReadFile(p)
+		if err == nil {
+			break
+		}
+	}
 	if err != nil {
 		return false
 	}
