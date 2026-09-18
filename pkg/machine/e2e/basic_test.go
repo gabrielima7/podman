@@ -268,6 +268,58 @@ var _ = Describe("run basic podman commands", func() {
 		Expect(out).ToNot(ContainSubstring(gvproxy))
 	})
 
+	It("Issue #29778 host port bind under WSL mirrored networking", func() {
+		if !isWSLMirroredNetworking() {
+			Skip("Skipping test: requires Windows with WSL2 mirrored networking enabled")
+		}
+
+		name := randomString()
+		i := new(initMachine).withImage(mb.imagePath).withNow()
+		session, err := mb.setName(name).setCmd(i).run()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(session).To(Exit(0))
+		defer func() {
+			stop := new(stopMachine)
+			_, _ = mb.setCmd(stop).run()
+		}()
+
+		bm := basicMachine{}
+		freePort, err := getFreePort()
+		Expect(err).ToNot(HaveOccurred())
+
+		probeName := "curlprobe-" + randomString()
+		probeURL := "http://host.containers.internal:" + freePort
+		// Explicitly test --network podman.
+		// The container loops probing the endpoint and records sent attempts.
+		probeCmd := []string{
+			"run", "-d", "--name", probeName, "--network", "podman", TESTIMAGE,
+			"sh", "-c", fmt.Sprintf("while true; do wget -q -T 1 -O- %s >/dev/null 2>&1 || true; echo sent >> /tmp/sent; sleep 0.5; done", probeURL),
+		}
+		probeExec, err := mb.setCmd(bm.withPodmanCommand(probeCmd)).run()
+		Expect(err).ToNot(HaveOccurred())
+		Expect(probeExec).To(Exit(0))
+
+		defer func() {
+			_, _ = mb.setCmd(bm.withPodmanCommand([]string{"rm", "-f", probeName})).run()
+		}()
+
+		// Explicit synchronization: verify container has actually sent traffic before attempting host bind
+		Eventually(func(g Gomega) {
+			checkTraffic, err := mb.setCmd(bm.withPodmanCommand([]string{"exec", probeName, "cat", "/tmp/sent"})).run()
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(checkTraffic).To(Exit(0))
+			g.Expect(checkTraffic.outputToString()).To(ContainSubstring("sent"))
+		}, "15s", "500ms").Should(Succeed(), "container failed to send probe traffic before host bind attempt")
+
+		probeServer, probeErr := tryStartLocalHTTPServer(freePort, "probe-ok")
+		if probeServer != nil {
+			defer probeServer.Close()
+		}
+
+		// The bind MUST work. If it fails in the affected environment, the test fails.
+		Expect(probeErr).ToNot(HaveOccurred(), "Issue #29778: host port bind failed after container traffic to host.containers.internal")
+	})
+
 	It("podman volume on non-standard path", func() {
 		skipIfWSL("Requires standard volume handling")
 		dir, err := os.MkdirTemp("", "machine-volume")
@@ -361,9 +413,11 @@ func testHTTPServer(port string, shouldErr bool, expectedResponse string) {
 	Expect(string(body)).Should(Equal(expectedResponse))
 }
 
-func startLocalHTTPServer(port string, response string) *http.Server {
+func tryStartLocalHTTPServer(port string, response string) (*http.Server, error) {
 	l, err := net.Listen("tcp", ":"+port)
-	Expect(err).ToNot(HaveOccurred())
+	if err != nil {
+		return nil, err
+	}
 	s := &http.Server{
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			fmt.Fprint(w, response)
@@ -373,7 +427,39 @@ func startLocalHTTPServer(port string, response string) *http.Server {
 		_ = s.Serve(l)
 		l.Close()
 	}()
+	return s, nil
+}
+
+func startLocalHTTPServer(port string, response string) *http.Server {
+	s, err := tryStartLocalHTTPServer(port, response)
+	Expect(err).ToNot(HaveOccurred())
 	return s
+}
+
+func getFreePort() (string, error) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return "", err
+	}
+	defer l.Close()
+	_, port, err := net.SplitHostPort(l.Addr().String())
+	return port, err
+}
+
+func isWSLMirroredNetworking() bool {
+	if runtime.GOOS != "windows" || !isWSL() {
+		return false
+	}
+	userProfile := os.Getenv("USERPROFILE")
+	if userProfile == "" {
+		return false
+	}
+	content, err := os.ReadFile(filepath.Join(userProfile, ".wslconfig"))
+	if err != nil {
+		return false
+	}
+	s := strings.ToLower(strings.ReplaceAll(string(content), " ", ""))
+	return strings.Contains(s, "networkingmode=mirrored")
 }
 
 type TLSConfig struct {
