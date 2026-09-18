@@ -269,8 +269,8 @@ var _ = Describe("run basic podman commands", func() {
 	})
 
 	It("Issue #29778 host port bind under WSL mirrored networking", func() {
-		if !isWSLMirroredNetworking() {
-			Skip("Skipping test: requires Windows with WSL2 mirrored networking enabled")
+		if !isWSLMirroredHostAddressLoopback() {
+			Skip("Skipping test: requires Windows with WSL2 mirrored networking (networkingMode=Mirrored) and hostAddressLoopback=true enabled")
 		}
 
 		name := randomString()
@@ -290,10 +290,13 @@ var _ = Describe("run basic podman commands", func() {
 		probeName := "curlprobe-" + randomString()
 		probeURL := "http://host.containers.internal:" + freePort
 		// Explicitly test --network podman.
-		// The container loops probing the endpoint and records sent attempts.
+		// The container logs the resolved IP and records real TCP connection attempts.
 		probeCmd := []string{
 			"run", "-d", "--name", probeName, "--network", "podman", TESTIMAGE,
-			"sh", "-c", fmt.Sprintf("while true; do wget -q -T 1 -O- %s >/dev/null 2>&1 || true; echo sent >> /tmp/sent; sleep 0.5; done", probeURL),
+			"sh", "-c", fmt.Sprintf(
+				"getent hosts host.containers.internal > /tmp/resolved.txt && while true; do wget -S -T 1 -O- %s >> /tmp/probe.log 2>&1 || true; sleep 0.5; done",
+				probeURL,
+			),
 		}
 		probeExec, err := mb.setCmd(bm.withPodmanCommand(probeCmd)).run()
 		Expect(err).ToNot(HaveOccurred())
@@ -303,13 +306,20 @@ var _ = Describe("run basic podman commands", func() {
 			_, _ = mb.setCmd(bm.withPodmanCommand([]string{"rm", "-f", probeName})).run()
 		}()
 
-		// Explicit synchronization: verify container has actually sent traffic before attempting host bind
+		// Explicit traffic verification: ensure host.containers.internal was resolved,
+		// the resolved IP was recorded, and a real TCP connection attempt was made before host bind
 		Eventually(func(g Gomega) {
-			checkTraffic, err := mb.setCmd(bm.withPodmanCommand([]string{"exec", probeName, "cat", "/tmp/sent"})).run()
+			resLog, err := mb.setCmd(bm.withPodmanCommand([]string{"exec", probeName, "cat", "/tmp/resolved.txt"})).run()
 			g.Expect(err).ToNot(HaveOccurred())
-			g.Expect(checkTraffic).To(Exit(0))
-			g.Expect(checkTraffic.outputToString()).To(ContainSubstring("sent"))
-		}, "15s", "500ms").Should(Succeed(), "container failed to send probe traffic before host bind attempt")
+			g.Expect(resLog).To(Exit(0))
+			g.Expect(resLog.outputToString()).To(ContainSubstring("host.containers.internal"))
+
+			tcpLog, err := mb.setCmd(bm.withPodmanCommand([]string{"exec", probeName, "cat", "/tmp/probe.log"})).run()
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(tcpLog).To(Exit(0))
+			out := tcpLog.outputToString()
+			g.Expect(out).To(Or(ContainSubstring("Connecting to host.containers.internal"), ContainSubstring("can't connect to remote host")))
+		}, "15s", "500ms").Should(Succeed(), "failed to confirm real TCP connection attempt from container before host bind")
 
 		probeServer, probeErr := tryStartLocalHTTPServer(freePort, "probe-ok")
 		if probeServer != nil {
@@ -446,7 +456,7 @@ func getFreePort() (string, error) {
 	return port, err
 }
 
-func isWSLMirroredNetworking() bool {
+func isWSLMirroredHostAddressLoopback() bool {
 	if runtime.GOOS != "windows" || !isWSL() {
 		return false
 	}
@@ -459,7 +469,7 @@ func isWSLMirroredNetworking() bool {
 		return false
 	}
 	s := strings.ToLower(strings.ReplaceAll(string(content), " ", ""))
-	return strings.Contains(s, "networkingmode=mirrored")
+	return strings.Contains(s, "networkingmode=mirrored") && strings.Contains(s, "hostaddressloopback=true")
 }
 
 type TLSConfig struct {
