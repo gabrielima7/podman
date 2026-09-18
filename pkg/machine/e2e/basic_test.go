@@ -1,6 +1,7 @@
 package e2e_test
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"log"
@@ -306,20 +307,31 @@ var _ = Describe("run basic podman commands", func() {
 			_, _ = mb.setCmd(bm.withPodmanCommand([]string{"rm", "-f", probeName})).run()
 		}()
 
-		// Explicit traffic verification: ensure host.containers.internal was resolved,
-		// the resolved IP was recorded, and a real TCP connection attempt was made before host bind
+		// Explicit traffic verification: ensure host.containers.internal was resolved to a valid IP,
+		// and an outbound TCP connect attempt was made by the container before the host bind is attempted.
+		// Note: This checks for an initiated connect attempt at the socket syscall level rather than raw
+		// packet-level SYN, since user-space wget output instruments socket connection results.
 		Eventually(func(g Gomega) {
 			resLog, err := mb.setCmd(bm.withPodmanCommand([]string{"exec", probeName, "cat", "/tmp/resolved.txt"})).run()
 			g.Expect(err).ToNot(HaveOccurred())
 			g.Expect(resLog).To(Exit(0))
-			g.Expect(resLog.outputToString()).To(ContainSubstring("host.containers.internal"))
+			resOutput := strings.TrimSpace(resLog.outputToString())
+			fields := strings.Fields(resOutput)
+			g.Expect(fields).ToNot(BeEmpty(), "resolved.txt should contain host entry")
+			parsedIP := net.ParseIP(fields[0])
+			g.Expect(parsedIP).ToNot(BeNil(), fmt.Sprintf("resolved host IP %q should be a valid IP address", fields[0]))
 
 			tcpLog, err := mb.setCmd(bm.withPodmanCommand([]string{"exec", probeName, "cat", "/tmp/probe.log"})).run()
 			g.Expect(err).ToNot(HaveOccurred())
 			g.Expect(tcpLog).To(Exit(0))
 			out := tcpLog.outputToString()
-			g.Expect(out).To(Or(ContainSubstring("Connecting to host.containers.internal"), ContainSubstring("can't connect to remote host")))
-		}, "15s", "500ms").Should(Succeed(), "failed to confirm real TCP connection attempt from container before host bind")
+			g.Expect(out).To(Or(
+				ContainSubstring("Connecting to host.containers.internal"),
+				ContainSubstring("can't connect to remote host"),
+				ContainSubstring("Connection refused"),
+				ContainSubstring("timed out"),
+			), "failed to confirm outbound TCP connect attempt from container before host bind")
+		}, "15s", "500ms").Should(Succeed(), "failed to confirm real TCP connect attempt from container before host bind")
 
 		probeServer, probeErr := tryStartLocalHTTPServer(freePort, "probe-ok")
 		if probeServer != nil {
@@ -456,6 +468,40 @@ func getFreePort() (string, error) {
 	return port, err
 }
 
+func parseWSLConfig(content string) (networkingMode string, hostAddressLoopback bool) {
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	currentSection := ""
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			currentSection = strings.ToLower(strings.TrimSpace(line[1 : len(line)-1]))
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(parts[0]))
+		val := strings.ToLower(strings.TrimSpace(parts[1]))
+		if idx := strings.IndexAny(val, "#;"); idx != -1 {
+			val = strings.TrimSpace(val[:idx])
+		}
+
+		if (currentSection == "wsl2" || currentSection == "") && key == "networkingmode" {
+			networkingMode = val
+		}
+		if (currentSection == "experimental" || currentSection == "wsl2") && key == "hostaddressloopback" {
+			if val == "true" || val == "1" {
+				hostAddressLoopback = true
+			}
+		}
+	}
+	return networkingMode, hostAddressLoopback
+}
+
 func isWSLMirroredHostAddressLoopback() bool {
 	if runtime.GOOS != "windows" || !isWSL() {
 		return false
@@ -468,8 +514,8 @@ func isWSLMirroredHostAddressLoopback() bool {
 	if err != nil {
 		return false
 	}
-	s := strings.ToLower(strings.ReplaceAll(string(content), " ", ""))
-	return strings.Contains(s, "networkingmode=mirrored") && strings.Contains(s, "hostaddressloopback=true")
+	mode, loopback := parseWSLConfig(string(content))
+	return strings.EqualFold(mode, "mirrored") && loopback
 }
 
 type TLSConfig struct {
